@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 # place cf-ddns.py and cf-ddns.conf on your server (e.g. /usr/local/bin/ or ~/)
 # run this command:
-# chmod +x /PATH_TO_FILE/cf-ddns.sh
+# chmod +x /PATH_TO_FILE/cf-ddns.py
 # open cf-ddns.conf in a text editor and set the necessary parameters.
 # (minimum config: one domain name, one host name, email address and api_key)
 # run `crontab -e` and append this line to it:
@@ -22,11 +22,12 @@ except ImportError:
     from urllib2 import URLError
 
 import json
-
+import os
 
 config_file_name = 'cf-ddns.conf'
+script_dir = os.path.dirname(__file__)
 
-with open(config_file_name, 'r') as config_file:
+with open(os.path.join(script_dir, config_file_name), 'r') as config_file:
     try:
         config = json.loads(config_file.read())
     except ValueError:
