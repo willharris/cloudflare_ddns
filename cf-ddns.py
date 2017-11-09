@@ -1,11 +1,12 @@
 #! /usr/bin/env python
-# place cf-ddns.py and cf-ddns.conf on your server (e.g. /usr/local/bin/ or ~/)
-# run this command:
-# chmod +x /PATH_TO_FILE/cf-ddns.py
-# open cf-ddns.conf in a text editor and set the necessary parameters.
-# (minimum config: one domain name, one host name, email address and api_key)
-# run `crontab -e` and append this line to it:
-# 0 */5 * * * * /PATH_TO_FILE/cf-ddns.py >/dev/null 2>&1
+# -*- coding: utf-8 -*-
+#
+# Based on code from https://github.com/AmirAzodi/cloudflare_ddns
+#
+
+import argparse
+import json
+import os
 
 try:
     # For Python 3.0 and later
@@ -13,7 +14,6 @@ try:
     from urllib.request import Request
     from urllib.error import URLError
     from urllib.error import HTTPError
-    # import urllib.parse
 except ImportError:
     # Fall back to Python 2's urllib2
     from urllib2 import urlopen
@@ -21,160 +21,204 @@ except ImportError:
     from urllib2 import HTTPError
     from urllib2 import URLError
 
-import json
-import os
+CF_BASE_URL = 'https://api.cloudflare.com/client/v4/zones/'
+IPV4_CHECKER = 'http://ipv4.icanhazip.com/'
+IPV6_CHECKER = 'http://ipv6.icanhazip.com/'
+CONFIG_FILE_NAME = 'cf-ddns.conf'
+SCRIPT_DIR = os.path.dirname(__file__)
 
-config_file_name = 'cf-ddns.conf'
-script_dir = os.path.dirname(__file__)
 
-with open(os.path.join(script_dir, config_file_name), 'r') as config_file:
-    try:
-        config = json.loads(config_file.read())
-    except ValueError:
-        print('* problem with the config file')
-        exit(0)
+class CloudFlareUpdater(object):
+    messages = []
+    config = None
+    content_header = None
+    public_ipv4 = None
+    public_ipv6 = None
 
-if not config['user']['email'] or not config['user']['api_key']:
-    print('* missing CloudFlare auth credentials')
-    exit(0)
+    def update_cloudflare(self, force=False):
+        self._load_config()
+        self._get_public_ips()
+        return self._process_domains(force=force)
 
-content_header = {'X-Auth-Email': config['user']['email'],
-                  'X-Auth-Key': config['user']['api_key'],
-                  'Content-type': 'application/json'}
+    def dump_log(self):
+        for msg in self.messages:
+            print('* %s' % msg)
 
-base_url = 'https://api.cloudflare.com/client/v4/zones/'
+    def _log(self, msg):
+        self.messages.append(msg)
 
-public_ipv4 = None
-public_ipv6 = None
-ip_version = None
+    def _load_config(self):
+        with open(os.path.join(SCRIPT_DIR, CONFIG_FILE_NAME), 'r') as config_file:
+            try:
+                self.config = json.loads(config_file.read())
+            except ValueError as ex:
+                raise RuntimeError('problem with the config file', ex)
 
-try:
-    public_ipv4 = urlopen(Request(
-        'http://ipv4.icanhazip.com/')).read().rstrip().decode('utf-8')
-except URLError as e:
-    print('* no public IPv4 address detected')
+        if self.config and (not self.config['user']['email'] or not self.config['user']['api_key']):
+            raise RuntimeError('missing CloudFlare auth credentials')
 
-try:
-    public_ipv6 = urlopen(Request(
-        'http://ipv6.icanhazip.com/')).read().rstrip().decode('utf-8')
-except URLError as e:
-    print('* no public IPv6 address detected')
+        self.content_header = {
+            'X-Auth-Email': self.config['user']['email'],
+            'X-Auth-Key': self.config['user']['api_key'],
+            'Content-type': 'application/json'
+        }
 
-if public_ipv4 is None and public_ipv4 is None:
-    print('* Failed to get any public IP address')
-    exit(0)
+        for idx, domain in enumerate(self.config['domains'], start=1):
+            # check to make sure domain name is specified
+            if not domain['name']:
+                raise RuntimeError('missing "name" for domain at slot %d' % idx)
 
-update = False
+            for host_idx, host in enumerate(domain['hosts'], start=1):
+                if not host['name']:
+                    raise RuntimeError('missing "name" for host %d in domain %s' % (host_idx, domain['name']))
 
-for domain in config['domains']:
-    # check to make sure domain name is specified
-    if not domain['name']:
-        print('* missing domain name')
-        continue
+                for host_type in host['types']:
+                    if host_type not in ('A', 'AAAA'):
+                        raise RuntimeError('wrong or missing dns record type "%s" for host %s in %s' % (host_type,
+                                                                                                        host['name'],
+                                                                                                        domain['name']))
 
-    # get domain zone id from CloudFlare if missing
-    if not domain['id']:
+    def _get_public_ips(self):
         try:
-            print(
-                '* zone id for "{0}" is missing. attempting to '
+            self.public_ipv4 = urlopen(Request(IPV4_CHECKER)).read().rstrip().decode('utf-8')
+            self._log('IPv4: %s' % self.public_ipv4)
+        except URLError:
+            self._log('no public IPv4 address detected')
+
+        try:
+            self.public_ipv6 = urlopen(Request(IPV6_CHECKER)).read().rstrip().decode('utf-8')
+            self._log('IPv6: %s' % self.public_ipv6)
+        except URLError:
+            self._log('no public IPv6 address detected')
+
+        if not (self.public_ipv4 or self.public_ipv6):
+            raise RuntimeError('Failed to get any public IP addresses')
+
+    def _process_domains(self, force=False):
+        for domain in self.config['domains']:
+            # get domain zone id from CloudFlare if missing
+            if not domain['id']:
+                self._get_domain_id(domain)
+                assert domain['id']
+
+            success = True
+            do_update_config = False
+
+            # get domain zone id from CloudFlare if missing
+            for host in domain['hosts']:
+                fqdn = '%s.%s' % (host['name'], domain['name'])
+
+                # get host id from CloudFlare if missing
+                if not host['id']:
+                    self._log('host id for "{0}" is missing. attempting to get it from cloudflare...'.format(fqdn))
+
+                    # TODO only need to do this once per domain, not per host
+                    rec_id_req = Request('{}{}/dns_records/'.format(CF_BASE_URL, domain['id']),
+                                         headers=self.content_header)
+
+                    rec_id_resp = urlopen(rec_id_req).read().decode('utf-8')
+                    parsed_host_ids = json.loads(rec_id_resp)
+
+                    for h in parsed_host_ids['result']:
+                        if fqdn == h['name']:
+                            host['id'] = h['id']
+                            self._log('host id for "{0}" is {1}'.format(fqdn, host['id']))
+
+                # iterate over the record types
+                for t in host['types']:
+                    # select which IP to use based on dns record type (e.g. A or AAAA)
+                    if t == 'A':
+                        if self.public_ipv4:
+                            public_ip = self.public_ipv4
+                            ip_version = 'ipv4'
+                        else:
+                            self._log('cannot set A record because no IPv4 is available')
+                            continue
+                    elif t == 'AAAA':
+                        if self.public_ipv6:
+                            public_ip = self.public_ipv6
+                            ip_version = 'ipv6'
+                        else:
+                            self._log('cannot set AAAA record because no IPv6 is available')
+                            continue
+
+                    # update ip address if it has changed since last update
+                    if force or host[ip_version] != public_ip:
+                        status = self._update_ip(domain, fqdn, host, ip_version, public_ip, t)
+                        do_update_config |= status
+                        success &= status
+
+            if do_update_config:
+                self._update_config()
+            else:
+                self._log('nothing to update')
+
+            return success
+
+    def _update_ip(self, domain, fqdn, host, ip_version, public_ip, host_type):
+        try:
+            data = json.dumps({
+                'id': host['id'],
+                'type': host_type,
+                'name': host['name'],
+                'content': public_ip
+            })
+
+            url_path = '{}{}{}{}'.format(CF_BASE_URL, domain['id'], '/dns_records/', host['id'])
+
+            update_request = Request(url_path, data=data.encode('utf-8'), headers=self.content_header)
+            update_request.get_method = lambda: 'PUT'
+
+            update_res = urlopen(update_request).read().decode('utf-8')
+            update_res_obj = json.loads(update_res)
+
+            if update_res_obj['success']:
+                host[ip_version] = public_ip
+                self._log('update successful (type: {0}, fqdn: {1}, ip: {2})'.format(host_type, fqdn, public_ip))
+                return True
+            else:
+                self._log('update failed (type: {}, fqdn: {}, ip: {}): {}'.format(
+                    host_type, fqdn, public_ip, update_res))
+                return False
+
+        except (Exception, HTTPError) as ex:
+            self._log('update failed (type: {}, fqdn: {}, ip: {}): {}'.format(host_type, fqdn, public_ip, ex))
+            return False
+
+    def _get_domain_id(self, domain):
+        try:
+            self._log(
+                'zone id for "{0}" is missing. attempting to '
                 'get it from cloudflare...'.format(domain['name']))
-            zone_id_req = Request(base_url, headers=content_header)
+            zone_id_req = Request(CF_BASE_URL, headers=self.content_header)
             zone_id_resp = urlopen(zone_id_req)
             for d in json.loads(zone_id_resp.read().decode('utf-8'))['result']:
                 if domain['name'] == d['name']:
                     domain['id'] = d['id']
-                    print('* zone id for "{0}" is'
-                          ' {1}'.format(domain['name'], domain['id']))
+                    self._log('zone id for "{0}" is'
+                             ' {1}'.format(domain['name'], domain['id']))
         except HTTPError as e:
-            print('* could not get zone id for: {0}'.format(domain['name']))
-            print('* possible causes: wrong domain and/or auth credentials')
-            continue
+            self._log('could not get zone id for: {0}'.format(domain['name']))
+            self._log('possible causes: wrong domain and/or auth credentials')
+            # continue
 
-    # get domain zone id from CloudFlare if missing
-    for host in domain['hosts']:
-        fqdn = host['name'] + '.' + domain['name']
+    def _update_config(self):
+        # if any records were updated, update the config file accordingly
+        with open(CONFIG_FILE_NAME, 'w') as config_file:
+            json.dump(self.config, config_file, indent=1, sort_keys=True)
+        self._log('configuration updated')
 
-        # check to make sure host name is specified
-        # otherwise move on to the next host
-        if not host['name']:
-            print('* host name missing')
-            continue
 
-        # get host id from CloudFlare if missing
-        if not host['id']:
-            print(
-                '* host id for "{0}" is missing. attempting'
-                ' to get it from cloudflare...'.format(fqdn))
-            rec_id_req = Request(
-                base_url + domain['id'] + '/dns_records/',
-                headers=content_header)
-            rec_id_resp = urlopen(rec_id_req)
-            parsed_host_ids = json.loads(rec_id_resp.read().decode('utf-8'))
-            for h in parsed_host_ids['result']:
-                if fqdn == h['name']:
-                    host['id'] = h['id']
-                    print('* host id for "{0}" is'
-                          ' {1}'.format(fqdn, host['id']))
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f", "--force", help="force setting of IP addresses",
+                        action="store_true")
+    parser.add_argument("-v", "--verbose", help="increase output verbosity",
+                        action="store_true")
+    args = parser.parse_args()
 
-        # iterate over the record types
-        for t in host['types']:
-            # select which IP to use based on dns record type (e.g. A or AAAA)
-            if t not in ('A', 'AAAA'):
-                print('* wrong or missing dns record type: {0}'.format(t))
-                continue
-            elif t == 'A':
-                if public_ipv4:
-                    public_ip = public_ipv4
-                    ip_version = 'ipv4'
-                else:
-                    print('* cannot set A record because no IPv4 is available')
-                    continue
-            elif t == 'AAAA':
-                if public_ipv6:
-                    public_ip = public_ipv6
-                    ip_version = 'ipv6'
-                else:
-                    print('* cannot set AAAA record because'
-                          ' no IPv6 is available')
-                    continue
+    updater = CloudFlareUpdater()
+    success = updater.update_cloudflare(force=args.force)
 
-            # update ip address if it has changed since last update
-            if host[ip_version] != public_ip:
-                try:
-                    # make sure dns record type is specified (e.g A, AAAA)
-                    if not t:
-                        raise Exception
-
-                    data = json.dumps({
-                        'id': host['id'],
-                        'type': t,
-                        'name': host['name'],
-                        'content': public_ip
-                    })
-                    url_path = '{0}{1}{2}{3}'.format(base_url,
-                                                     domain['id'],
-                                                     '/dns_records/',
-                                                     host['id'])
-                    update_request = Request(
-                        url_path,
-                        data=data.encode('utf-8'),
-                        headers=content_header)
-                    update_request.get_method = lambda: 'PUT'
-                    update_res_obj = json.loads(
-                        urlopen(update_request).read().decode('utf-8'))
-                    if update_res_obj['success']:
-                        update = True
-                        host[ip_version] = public_ip
-                        print('* update successful (type: {0}, fqdn: {1}'
-                              ', ip: {2})'.format(t, fqdn, public_ip))
-                except (Exception, HTTPError) as e:
-                    print('* update failed (type: {0}, fqdn: {1}'
-                          ', ip: {2})'.format(t, fqdn, public_ip))
-
-# if any records were updated, update the config file accordingly
-if update:
-    print('* updates completed. bye.')
-    with open(config_file_name, 'w') as config_file:
-        json.dump(config, config_file, indent=1, sort_keys=True)
-else:
-    print('* nothing to update. bye.')
+    if args.verbose or not success:
+        updater.dump_log()
